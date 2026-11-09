@@ -1,0 +1,295 @@
+# EEG-осциллограф в реальном времени: BrainFlow + Matplotlib (FuncAnimation)
+# с имитацией морганий для синтетической платы.
+#
+# Как устроена имитация моргания:
+#   1. Отдельный поток каждые 3-4 секунды вызывает board.insert_marker(BLINK_MARKER).
+#      BrainFlow записывает это число в канал маркеров ближайшего отсчёта,
+#      то есть момент моргания "вшивается" прямо в поток данных.
+#   2. Функция обновления графика находит маркеры в полученных данных и
+#      добавляет к сигналу форму моргания, начиная с отсчёта маркера.
+#      Поскольку моргание привязано к конкретному отсчёту, пик честно
+#      "уезжает" влево вместе с сигналом, как на настоящем осциллографе.
+#
+# Запуск: сохраните файл и выполните в терминале  python realtime_eeg.py
+# Закройте окно графика, чтобы остановить сбор данных.
+
+import random
+import threading
+import time
+
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation
+from brainflow.board_shim import BoardShim, BrainFlowInputParams, BoardIds
+
+# ------------------------------------------------------------------
+# Настройки отображения
+# ------------------------------------------------------------------
+WINDOW_SECONDS = 5          # сколько секунд сигнала видно на экране
+UPDATE_INTERVAL_MS = 100    # как часто обновлять график (мс)
+CHANNEL_INDEX = 0           # какой ЭЭГ-канал показывать (0 = первый)
+REMOVE_DC = True            # убирать постоянную составляющую
+RING_BUFFER_SIZE = 45000    # размер кольцевого буфера BrainFlow (в отсчётах)
+
+# ------------------------------------------------------------------
+# Настройки имитации моргания
+# ------------------------------------------------------------------
+SIMULATE_BLINKS = True      # включить/выключить имитацию (для реальной гарнитуры - False)
+BLINK_MIN_INTERVAL = 3.0    # минимальная пауза между морганиями (с)
+BLINK_MAX_INTERVAL = 4.0    # максимальная пауза между морганиями (с)
+BLINK_DURATION = 0.4        # длительность одного моргания (с)
+BLINK_PEAK_TIME = 0.1       # через сколько секунд от начала достигается пик (с)
+BLINK_AMPLITUDE = None      # высота пика в единицах сигнала (мкВ).
+                            # None = подобрать автоматически: 8 стандартных
+                            # отклонений фонового сигнала, чтобы пик был хорошо виден
+BLINK_MARKER = 1.0          # число, которое пишется в канал маркеров при моргании
+
+# ------------------------------------------------------------------
+# Настройки детектора морганий
+# ------------------------------------------------------------------
+THRESHOLD = 40.0            # порог срабатывания (в единицах сигнала на графике)
+RESET_LEVEL = 20.0          # сигнал должен опуститься ниже этого уровня, чтобы детектор
+                            # снова "взвёлся" (гистерезис: защита от дребезга у порога)
+REFRACTORY_SECONDS = 0.5    # минимальная пауза между двумя срабатываниями (с)
+
+# ------------------------------------------------------------------
+# Надпись на графике при срабатывании
+# ------------------------------------------------------------------
+ALERT_TEXT = "BLINK DETECTED!"
+ALERT_DURATION = 0.5        # сколько секунд надпись видна после срабатывания
+ALERT_POSITION = (0.5, 0.5) # где на графике: (0.5, 0.5) - центр,
+                            # (0.97, 0.93) - правый верхний угол (доли ширины/высоты осей)
+
+
+def make_blink_shape(sampling_rate):
+    """
+    Форма одного моргания, нормированная на пик = 1.
+
+    Настоящее моргание на ЭЭГ (особенно на лобных каналах Fp1/Fp2) выглядит
+    как большой положительный "горб": быстрый подъём и более медленный спад,
+    всего около 200-400 мс. Такую асимметрию хорошо даёт гамма-подобная функция
+    (t / tp)^k * exp(k * (1 - t / tp)), у которой максимум равен 1 при t = tp.
+    """
+    n = int(BLINK_DURATION * sampling_rate)
+    t = np.arange(n) / sampling_rate
+    k = 3.0
+    shape = (t / BLINK_PEAK_TIME) ** k * np.exp(k * (1 - t / BLINK_PEAK_TIME))
+    return shape
+
+
+def blink_generator(board, stop_event):
+    """
+    Фоновый поток: через случайные промежутки 3-4 с ставит маркер моргания.
+
+    stop_event.wait(...) работает как sleep, но позволяет мгновенно
+    завершить поток при закрытии окна.
+    """
+    while not stop_event.wait(random.uniform(BLINK_MIN_INTERVAL, BLINK_MAX_INTERVAL)):
+        try:
+            board.insert_marker(BLINK_MARKER)
+            print("Моргание!")
+        except Exception as e:  # например, если поток данных уже остановлен
+            print(f"Не удалось поставить маркер: {e}")
+            break
+
+
+def main():
+    # 1. Настройка параметров и выбор платы
+    params = BrainFlowInputParams()
+    # ВОТ ЭТА СТРОКА ОТВЕЧАЕТ ЗА ФЕЙКОВЫЙ СИГНАЛ.
+    # Когда купите гарнитуру, поменяйте её на ID вашей платы (например, BoardIds.CYTON_BOARD),
+    # укажите порт: params.serial_port = "COM3" (Windows) или "/dev/ttyUSB0" (Linux),
+    # и выключите SIMULATE_BLINKS - настоящие моргания появятся сами.
+    board_id = BoardIds.SYNTHETIC_BOARD.value
+    board = BoardShim(board_id, params)
+
+    # Информация о плате
+    sampling_rate = BoardShim.get_sampling_rate(board_id)
+    eeg_channels = BoardShim.get_eeg_channels(board_id)
+    channel = eeg_channels[CHANNEL_INDEX]
+    marker_channel = BoardShim.get_marker_channel(board_id)  # канал, куда пишутся маркеры
+    timestamp_channel = BoardShim.get_timestamp_channel(board_id)  # время каждого отсчёта
+
+    window_size = int(WINDOW_SECONDS * sampling_rate)  # отсчётов в окне
+    blink_shape = make_blink_shape(sampling_rate)
+    blink_len = len(blink_shape)
+
+    # Состояние, которое сохраняется между кадрами
+    state = {
+        "blink_amplitude": BLINK_AMPLITUDE,  # подбирается один раз
+        "last_ts": -np.inf,       # время последнего уже проверенного отсчёта
+        "above": False,           # находится ли сигнал сейчас выше порога
+        "last_trigger": -np.inf,  # время последнего срабатывания
+        "count": 0,               # сколько морганий обнаружено
+        "alert_until": 0.0,       # до какого момента (time.monotonic) показывать надпись
+    }
+
+    # 2. Запуск сбора данных
+    print("Запуск сбора данных...")
+    board.prepare_session()
+    board.start_stream(RING_BUFFER_SIZE)
+
+    # 3. Запуск потока-генератора морганий
+    stop_event = threading.Event()
+    blink_thread = None
+    if SIMULATE_BLINKS:
+        blink_thread = threading.Thread(
+            target=blink_generator, args=(board, stop_event), daemon=True
+        )
+        blink_thread.start()
+
+    try:
+        # 4. Подготовка графика
+        # Ось времени от -5 до 0 секунд: справа - "сейчас"
+        time_axis = (np.arange(window_size) - window_size) / sampling_rate
+
+        fig, ax = plt.subplots(figsize=(10, 5))
+        (line,) = ax.plot(time_axis, np.full(window_size, np.nan), linewidth=1)
+
+        ax.set_xlim(time_axis[0], 0)
+        ax.set_ylim(-100, 100)
+        title = f"Real-time EEG, channel {channel} (BrainFlow, {sampling_rate} Hz)"
+        if SIMULATE_BLINKS:
+            title += " + simulated blinks"
+        ax.set_title(title)
+        ax.set_xlabel("Time (seconds)")
+        ax.set_ylabel("Amplitude (µV)")
+        ax.grid(True)
+
+        # Красная пунктирная линия порога срабатывания
+        ax.axhline(THRESHOLD, color="red", linestyle="--", linewidth=1.5,
+                   label=f"Порог = {THRESHOLD:g}")
+        ax.legend(loc="upper left")
+
+        # Надпись "BLINK DETECTED!": создаём один раз и сразу прячем.
+        # transform=ax.transAxes - координаты в долях осей (0..1), поэтому надпись
+        # стоит на месте, как бы ни менялся масштаб по вертикали.
+        ha = "center" if ALERT_POSITION[0] == 0.5 else ("right" if ALERT_POSITION[0] > 0.5 else "left")
+        alert_text = ax.text(
+            *ALERT_POSITION,
+            ALERT_TEXT,
+            transform=ax.transAxes,
+            ha=ha,
+            va="center",
+            fontsize=36,
+            fontweight="bold",
+            color="red",
+            zorder=10,  # поверх линии сигнала
+            bbox=dict(facecolor="white", edgecolor="red", alpha=0.8, boxstyle="round,pad=0.3"),
+        )
+        alert_text.set_visible(False)
+
+        def detect_blinks(signal, timestamps):
+            """
+            Детектор морганий по порогу.
+
+            Проверяем только НОВЫЕ отсчёты, пришедшие с прошлого кадра
+            (за 100 мс их около 25), чтобы каждый отсчёт оценивался ровно один раз.
+            Проверять только последнее значение нельзя: короткий пик мог
+            целиком пройти между двумя обновлениями графика.
+
+            Сообщение выводится один раз - в момент перехода снизу вверх через THRESHOLD.
+            Повторно детектор "взводится", только когда сигнал опустится ниже RESET_LEVEL.
+            """
+            new = timestamps > state["last_ts"]
+            for value, ts in zip(signal[new], timestamps[new]):
+                if state["above"]:
+                    # Ждём, пока сигнал вернётся вниз, чтобы снова взвести детектор
+                    if value < RESET_LEVEL:
+                        state["above"] = False
+                elif value > THRESHOLD:
+                    # Переход через порог снизу вверх
+                    state["above"] = True
+                    if ts - state["last_trigger"] >= REFRACTORY_SECONDS:
+                        state["last_trigger"] = ts
+                        state["count"] += 1
+                        print(f">>> СРАБОТАЛО! ОБНАРУЖЕНО МОРГАНИЕ <<<  (#{state['count']})")
+                        # Включаем надпись на ALERT_DURATION секунд.
+                        # Используем часы компьютера (time.monotonic), а не время
+                        # отсчётов: надпись должна гаснуть по реальному времени на экране.
+                        state["alert_until"] = time.monotonic() + ALERT_DURATION
+            if len(timestamps):
+                state["last_ts"] = timestamps[-1]
+
+        # 5. Функция обновления: вызывается каждые UPDATE_INTERVAL_MS мс
+        def update(_frame):
+            # Берём чуть больше, чем окно: на blink_len отсчётов.
+            # Тогда моргание, которое началось чуть левее края окна,
+            # всё равно будет корректно дорисовано своим "хвостом".
+            data = board.get_current_board_data(window_size + blink_len)
+            n_total = data.shape[1]
+            if n_total == 0:
+                return (line,)
+
+            signal = data[channel].copy()  # копия, чтобы не портить исходные данные
+
+            if SIMULATE_BLINKS:
+                # Один раз подбираем амплитуду моргания под масштаб сигнала
+                if state["blink_amplitude"] is None and n_total >= sampling_rate:
+                    state["blink_amplitude"] = 8 * np.std(signal)
+                    print(f"Амплитуда моргания: {state['blink_amplitude']:.1f}")
+
+                amplitude = state["blink_amplitude"]
+                if amplitude is not None:
+                    # Находим отсчёты, где стоит маркер моргания
+                    onsets = np.where(data[marker_channel] == BLINK_MARKER)[0]
+                    for start in onsets:
+                        end = min(start + blink_len, n_total)
+                        signal[start:end] += amplitude * blink_shape[: end - start]
+
+            # Обрезаем до видимого окна (последние window_size отсчётов)
+            signal = signal[-window_size:]
+            timestamps = data[timestamp_channel][-window_size:]
+            n = len(signal)
+
+            if REMOVE_DC:
+                # Медиана вместо среднего: большой пик моргания не сдвигает базовую линию
+                signal = signal - np.median(signal)
+
+            # Проверяем порог на том же сигнале, что нарисован на графике,
+            # чтобы срабатывание совпадало с пересечением красной линии
+            detect_blinks(signal, timestamps)
+
+            # Показываем надпись, пока не прошло ALERT_DURATION секунд с срабатывания.
+            # Проверка идёт каждый кадр (100 мс), поэтому надпись гаснет через 0.5-0.6 с.
+            alert_text.set_visible(time.monotonic() < state["alert_until"])
+
+            # Если данных пока меньше 5 секунд - прижимаем их к правому краю
+            y = np.full(window_size, np.nan)
+            y[-n:] = signal
+            line.set_ydata(y)
+
+            # Автомасштаб по вертикали с небольшим запасом
+            # (порог всегда включаем в диапазон, чтобы красная линия не пропадала с экрана)
+            lo = min(np.min(signal), THRESHOLD)
+            hi = max(np.max(signal), THRESHOLD)
+            margin = (hi - lo) * 0.1 or 1.0
+            ax.set_ylim(lo - margin, hi + margin)
+
+            return (line,)
+
+        # 6. Запуск анимации (объект обязательно сохраняем в переменную!)
+        anim = FuncAnimation(
+            fig,
+            update,
+            interval=UPDATE_INTERVAL_MS,
+            blit=False,
+            cache_frame_data=False,
+        )
+
+        print("Окно открыто. Закройте его, чтобы остановить запись.")
+        plt.show()  # блокирует выполнение, пока окно не закрыто
+
+    finally:
+        # 7. Останавливаем генератор морганий, затем поток данных и плату
+        stop_event.set()
+        if blink_thread is not None:
+            blink_thread.join(timeout=1.0)
+        if board.is_prepared():
+            board.stop_stream()
+            board.release_session()
+        print("Сбор данных остановлен, плата освобождена.")
+
+
+if __name__ == "__main__":
+    main()
